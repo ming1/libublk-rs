@@ -101,6 +101,41 @@ installed under /usr/local/sbin or other directory which has to match
 with the udev rules.
 
 
+libublk also supports async/await for handling IO command from linux ublk
+driver, and it just takes async `q_handler`, such as:
+
+``` rust
+async fn null_handle_io_cmd(q: &UblkQueue<'_>, tag: u16, _data: u64) {
+    let iod = q.get_iod(tag);
+    let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+
+    q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
+}
+let q_handler = move |qid: u16, _dev: &UblkDev| {
+    let q_rc = Rc::new(UblkQueue::new(qid as u16, &_dev).unwrap());
+    let exe_rc = Rc::new(Executor::new(_dev.get_nr_ios()));
+    let q = q_rc.clone();
+    let exe = exe_rc.clone();
+
+    let io_handler = move |_q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
+        let q = q_rc.clone();
+        let data = io.user_data();
+
+        exe.spawn(tag as u16, async move {
+            null_handle_io_cmd(&q, tag, data).await;
+        });
+    };
+    q.wait_and_handle_io_cmd(&exe_rc, io_handler);
+}
+```
+
+Device wide data can be shared in each queue/io handler by
+Arc::new(Mutex::new(Data)) and the queue handler closure supports Clone(),
+see [`test_ublk_null_async():tests/basic.rs`](tests/basic.rs)
+
+Queue wide data is per-thread and can be shared in io handler by
+Rc() & RefCell().
+
 ## Test
 
 You can run the test of the library with ```cargo test```

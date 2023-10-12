@@ -1,6 +1,6 @@
 #[cfg(feature = "fat_complete")]
 use super::UblkFatRes;
-use super::{ctrl::UblkCtrl, sys, UblkError, UblkIORes};
+use super::{ctrl::UblkCtrl, exe::Executor, sys, UblkError, UblkIORes};
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, info, trace};
 use serde::{Deserialize, Serialize};
@@ -123,6 +123,21 @@ impl<'a> UblkIOCtx<'a> {
         tag as u64 | (op << 16) as u64 | (tgt_data << 24) as u64 | ((is_target_io as u64) << 63)
     }
 
+    /// Build userdata for async io_uring OP
+    ///
+    /// # Arguments:
+    /// * `tag`: io tag, length is 16bit
+    /// * `op`: io operation code, length is 8bit
+    /// * `op_id`: unique id in io task
+    ///
+    /// The built userdata has to be unique in this io task, so that
+    /// our executor can figure out the exact submitted OP with
+    /// completed cqe
+    #[inline(always)]
+    pub fn build_user_data_async(tag: u16, op: u32, op_id: u32) -> u64 {
+        Self::build_user_data(tag, op, op_id, true)
+    }
+
     /// Extract tag from userdata
     #[inline(always)]
     pub fn user_data_to_tag(user_data: u64) -> u32 {
@@ -139,6 +154,13 @@ impl<'a> UblkIOCtx<'a> {
     #[inline(always)]
     fn is_target_io(user_data: u64) -> bool {
         (user_data & (1_u64 << 63)) != 0
+    }
+
+    /// Check if this userdata is from IO command which is from
+    /// ublk driver
+    #[inline(always)]
+    fn is_io_command(user_data: u64) -> bool {
+        (user_data & (1_u64 << 63)) == 0
     }
 }
 
@@ -280,6 +302,13 @@ impl UblkDev {
             },
             ..Default::default()
         };
+    }
+
+    /// Return how many io slots, which is usually same with executor's
+    /// nr_tasks.
+    #[inline]
+    pub fn get_nr_ios(&self) -> u16 {
+        self.dev_info.queue_depth + self.tgt.extra_ios as u16
     }
 }
 
@@ -939,6 +968,74 @@ impl UblkQueue<'_> {
         }
     }
 
+    /// process incoming io commands by io handler closure `ops` in which
+    /// the queue reference has to be from queue environment
+    pub(crate) fn process_io_cmds<F>(
+        &self,
+        exe: &Executor,
+        mut ops: F,
+        to_wait: usize,
+    ) -> Result<i32, UblkError>
+    where
+        F: FnMut(u16, &UblkIOCtx),
+    {
+        match self.wait_ios(to_wait) {
+            Err(r) => Err(r),
+            Ok(done) => {
+                for idx in 0..done {
+                    let cqe = {
+                        match self.q_ring.borrow_mut().completion().next() {
+                            None => return Err(UblkError::OtherError(-libc::EINVAL)),
+                            Some(r) => r,
+                        }
+                    };
+
+                    let e = UblkIOCtx(
+                        &cqe,
+                        if idx == 0 {
+                            UblkIOCtx::UBLK_IO_F_FIRST
+                        } else {
+                            0
+                        } | if idx + 1 == done {
+                            UblkIOCtx::UBLK_IO_F_LAST
+                        } else {
+                            0
+                        },
+                    );
+
+                    let data = e.user_data();
+                    let res = e.result();
+                    let tag = UblkIOCtx::user_data_to_tag(data);
+
+                    {
+                        let cmd_op = UblkIOCtx::user_data_to_op(data);
+                        trace!(
+                            "{}: res {} (qid {} tag {} cmd_op {} target {}) state {:?}",
+                            "handle_cqe",
+                            res,
+                            self.q_id,
+                            tag,
+                            cmd_op,
+                            UblkIOCtx::is_target_io(data),
+                            self.state.borrow(),
+                        );
+                    }
+                    if UblkIOCtx::is_io_command(data) {
+                        self.update_state(e.0);
+
+                        if res == sys::UBLK_IO_RES_OK as i32 {
+                            assert!(tag < self.q_depth);
+                            ops(tag as u16, &e);
+                        }
+                    } else {
+                        exe.wake_with_uring_cqe(tag as u16, &cqe);
+                    }
+                }
+                Ok(0)
+            }
+        }
+    }
+
     /// Wait and handle incoming IO
     ///
     /// # Arguments:
@@ -954,6 +1051,27 @@ impl UblkQueue<'_> {
     {
         loop {
             match self.process_ios(&mut ops, 1) {
+                Err(_) => break,
+                _ => continue,
+            }
+        }
+    }
+
+    /// Wait and handle incoming IO command
+    ///
+    /// # Arguments:
+    ///
+    /// * `ops`: IO handling closure
+    ///
+    /// Called in queue context. won't return unless error is observed.
+    /// Wait and handle any incoming cqe until queue is down.
+    ///
+    pub fn wait_and_handle_io_cmd<F>(&self, exe: &Executor, mut ops: F)
+    where
+        F: FnMut(u16, &UblkIOCtx),
+    {
+        loop {
+            match self.process_io_cmds(exe, &mut ops, 1) {
                 Err(_) => break,
                 _ => continue,
             }
