@@ -154,6 +154,9 @@ installed under /usr/local/sbin or other directory which has to match
 with the udev rules.
 
 
+ * [`examples/loop.rs`](examples/loop.rs): the whole example using async/await
+
+
 ## Test
 
 You can run the test of the library with ```cargo test```
