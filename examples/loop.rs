@@ -3,10 +3,13 @@ use clap::{Arg, ArgAction, Command};
 use io_uring::{opcode, squeue, types};
 use libublk::dev_flags::*;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes, UblkSession};
+use libublk::{
+    ctrl::UblkCtrl, exe::Executor, exe::UringOpFuture, UblkError, UblkIORes, UblkSession,
+};
 use log::trace;
 use serde::Serialize;
 use std::os::unix::io::AsRawFd;
+use std::rc::Rc;
 
 #[derive(Debug, Serialize)]
 struct LoJson {
@@ -57,20 +60,22 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<serde_json::Value, Ubl
     )
 }
 
-fn loop_queue_tgt_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx) {
+#[inline]
+fn __lo_handle_io_cmd(
+    q: &UblkQueue<'_>,
+    tag: u16,
+    iod: &libublk::sys::ublksrv_io_desc,
+    data: u64,
+) -> bool {
+    let op = iod.op_flags & 0xff;
     // either start to handle or retry
-    let _iod = q.get_iod(tag);
-    let iod = unsafe { &*_iod };
-
     let off = (iod.start_sector << 9) as u64;
     let bytes = (iod.nr_sectors << 9) as u32;
-    let op = iod.op_flags & 0xff;
-    let data = UblkIOCtx::build_user_data(tag as u16, op, 0, true);
     let buf_addr = q.get_io_buf_addr(tag);
 
     if op == libublk::sys::UBLK_IO_OP_WRITE_ZEROES || op == libublk::sys::UBLK_IO_OP_DISCARD {
         q.complete_io_cmd(tag, Err(UblkError::OtherError(-libc::EINVAL)));
-        return;
+        return true;
     }
 
     match op {
@@ -116,12 +121,38 @@ fn loop_queue_tgt_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx) {
                     .expect("submission fail");
             }
         }
-        _ => q.complete_io_cmd(tag, Err(UblkError::OtherError(-libc::EINVAL))),
+        _ => {
+            q.complete_io_cmd(tag, Err(UblkError::OtherError(-libc::EINVAL)));
+            return true;
+        }
     };
+
+    return false;
 }
 
-fn _lo_handle_io(q: &UblkQueue, tag: u16, i: &UblkIOCtx) {
-    // our IO on backing file is done
+async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16) {
+    let _iod = q.get_iod(tag);
+    let iod = unsafe { &*_iod };
+    let op = iod.op_flags & 0xff;
+    let data = UblkIOCtx::build_user_data_async(tag as u16, op, 0);
+    for i in 0..4 {
+        if !__lo_handle_io_cmd(q, tag, iod, data) {
+            // wait until the io_uring IO completed
+            let res = UringOpFuture { user_data: data }.await;
+
+            if res != -(libc::EAGAIN) || i == 3 {
+                q.complete_io_cmd(tag, Ok(UblkIORes::Result(res)));
+                break;
+            }
+        }
+    }
+}
+
+fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx) {
+    let _iod = q.get_iod(tag);
+    let iod = unsafe { &*_iod };
+    let op = iod.op_flags & 0xff;
+    let data = UblkIOCtx::build_user_data(tag as u16, op, 0, true);
     if i.is_tgt_io() {
         let user_data = i.user_data();
         let res = i.result();
@@ -134,8 +165,7 @@ fn _lo_handle_io(q: &UblkQueue, tag: u16, i: &UblkIOCtx) {
             return;
         }
     }
-
-    loop_queue_tgt_io(q, tag, i);
+    __lo_handle_io_cmd(q, tag, iod, data);
 }
 
 fn test_add(
@@ -145,6 +175,7 @@ fn test_add(
     buf_sz: u32,
     backing_file: &String,
     ctrl_flags: u64,
+    aio: bool,
 ) {
     let _pid = unsafe { libc::fork() };
 
@@ -173,19 +204,40 @@ fn test_add(
 
             let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo);
             let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-            let q_fn = move |qid: u16, _dev: &UblkDev| {
-                let lo_io_handler =
-                    move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| _lo_handle_io(q, tag, io);
+            let q_async_fn = move |qid: u16, dev: &UblkDev| {
+                let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
+                let exe_rc = Rc::new(Executor::new(dev.get_nr_ios()));
+                let q = q_rc.clone();
+                let exe = exe_rc.clone();
 
+                let lo_io_handler = move |tag: u16, _io: &UblkIOCtx| {
+                    let q = q_rc.clone();
+
+                    exe.spawn(tag as u16, async move {
+                        lo_handle_io_cmd_async(&q, tag).await;
+                    });
+                };
+                q.wait_and_handle_io_cmd(&exe_rc, lo_io_handler, None);
+            };
+
+            let q_sync_fn = move |qid: u16, _dev: &UblkDev| {
+                let lo_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
+                    lo_handle_io_cmd_sync(q, tag, io)
+                };
                 UblkQueue::new(qid, _dev)
                     .unwrap()
                     .wait_and_handle_io(lo_io_handler);
             };
 
-            sess.run_target(&mut ctrl, &dev, q_fn, |dev_id| {
-                let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-                d_ctrl.dump();
-            })
+            sess.run_target(
+                &mut ctrl,
+                &dev,
+                if aio { q_async_fn } else { q_sync_fn },
+                |dev_id| {
+                    let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+                    d_ctrl.dump();
+                },
+            )
             .unwrap()
         };
         wh.join().unwrap();
@@ -246,6 +298,13 @@ fn main() {
                         .required(true)
                         .help("backing file")
                         .action(ArgAction::Set),
+                )
+                .arg(
+                    Arg::new("async")
+                        .long("async")
+                        .short('a')
+                        .action(ArgAction::SetTrue)
+                        .help("use async/await to handle IO command"),
                 ),
         )
         .subcommand(
@@ -290,7 +349,20 @@ fn main() {
             } else {
                 0
             };
-            test_add(id, nr_queues, depth, buf_size, backing_file, ctrl_flags);
+            let aio = if add_matches.get_flag("async") {
+                true
+            } else {
+                false
+            };
+            test_add(
+                id,
+                nr_queues,
+                depth,
+                buf_size,
+                backing_file,
+                ctrl_flags,
+                aio,
+            );
         }
         Some(("del", add_matches)) => {
             let id = add_matches

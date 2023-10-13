@@ -136,6 +136,9 @@ see [`test_ublk_null_async():tests/basic.rs`](tests/basic.rs)
 Queue wide data is per-thread and can be shared in io handler by
 Rc() & RefCell().
 
+ * [`examples/loop.rs`](examples/loop.rs): the whole example using async/await
+
+
 ## Test
 
 You can run the test of the library with ```cargo test```
