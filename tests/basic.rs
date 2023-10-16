@@ -170,17 +170,20 @@ mod integration {
         }
 
         //Device wide data shared among all queue context
+        #[derive(Debug, Clone, Default)]
         struct DevData {
             spawned: u32,
             nr_batch: u32,
+            nr_last_cqe: u32,
         }
 
+        let dev_flags = UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_PROVIDE_BATCH_LAST;
         let sess = libublk::UblkSessionBuilder::default()
             .name("null")
             .nr_queues(2_u16)
             .depth(4_u16)
             .id(-1)
-            .dev_flags(UBLK_DEV_F_ADD_DEV)
+            .dev_flags(dev_flags)
             .build()
             .unwrap();
 
@@ -191,8 +194,7 @@ mod integration {
 
         // device data is shared among all queue contexts
         let dev_data = Arc::new(Mutex::new(DevData {
-            spawned: 0,
-            nr_batch: 0,
+            ..Default::default()
         }));
         let saved_dev_data_addr = Arc::new(Mutex::new({
             std::ptr::addr_of!(*(dev_data.lock().unwrap())) as u64
@@ -215,10 +217,18 @@ mod integration {
             // make sure that all queues see same device data
             let _dev_addr = Rc::new(saved_dev_data_addr);
 
-            let io_handler = move |tag: u16, _io: &UblkIOCtx| {
+            let io_handler = move |tag: u16, io: &UblkIOCtx| {
                 let q = q_rc.clone();
                 let __dev_data = _dev_data.clone();
                 let __dev_addr = _dev_addr.clone();
+
+                //just for cover UblkQueue::is_last_io_ctx()
+                {
+                    let mut guard = __dev_data.lock().unwrap();
+                    if q.is_last_io_ctx(io) {
+                        (*guard).nr_last_cqe += 1;
+                    }
+                }
 
                 exe.spawn(tag as u16, async move {
                     {
@@ -235,16 +245,18 @@ mod integration {
             let bg_handler = move |_done: i32| {
                 let mut guard = _dev_data_bg.lock().unwrap();
                 (*guard).nr_batch += 1;
+
+                assert!((*guard).nr_batch >= (*guard).nr_last_cqe);
             };
             q.wait_and_handle_io_cmd(&exe_rc, io_handler, Some(Box::new(bg_handler)));
         };
 
         // kick off our targets
-        sess.run_target(&mut ctrl, &dev, q_fn, |dev_id| {
+        sess.run_target(&mut ctrl, &dev, q_fn, move |dev_id| {
             let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
 
             // run sanity and disk IO test after ublk disk is ready
-            run_ublk_disk_sanity_test(&mut ctrl, UBLK_DEV_F_ADD_DEV);
+            run_ublk_disk_sanity_test(&mut ctrl, dev_flags);
             read_ublk_disk(dev_id);
 
             ctrl.del().unwrap();

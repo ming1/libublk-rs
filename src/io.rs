@@ -1,6 +1,6 @@
 #[cfg(feature = "fat_complete")]
 use super::UblkFatRes;
-use super::{ctrl::UblkCtrl, exe::Executor, sys, UblkError, UblkIORes};
+use super::{ctrl::UblkCtrl, dev_flags::*, exe::Executor, sys, UblkError, UblkIORes};
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, info, trace};
 use serde::{Deserialize, Serialize};
@@ -24,12 +24,9 @@ use std::os::unix::io::AsRawFd;
 /// UblkIOCtx & UblkQueue provide enough information for target code to
 /// handle this CQE and implement target IO handling logic.
 ///
-pub struct UblkIOCtx<'a>(&'a cqueue::Entry, u32);
+pub struct UblkIOCtx<'a>(&'a cqueue::Entry);
 
 impl<'a> UblkIOCtx<'a> {
-    const UBLK_IO_F_FIRST: u32 = 1u32 << 16;
-    const UBLK_IO_F_LAST: u32 = 1u32 << 17;
-
     /// Return CQE's request of this IO, and used for handling target IO by
     /// io_uring. When the target IO is completed, its CQE is coming and we
     /// parse the IO result with result().
@@ -64,18 +61,6 @@ impl<'a> UblkIOCtx<'a> {
     #[inline(always)]
     pub fn is_tgt_io(&self) -> bool {
         Self::is_target_io(self.0.user_data())
-    }
-
-    /// if this IO represented by CQE is the last one in current batch
-    #[inline(always)]
-    pub fn is_last_cqe(&self) -> bool {
-        (self.1 & Self::UBLK_IO_F_LAST) != 0
-    }
-
-    /// if this IO represented by CQE is the first one in current batch
-    #[inline(always)]
-    pub fn is_first_cqe(&self) -> bool {
-        (self.1 & Self::UBLK_IO_F_FIRST) != 0
     }
 
     /// Build offset for read from or write to per-io-cmd buffer
@@ -322,6 +307,7 @@ impl Drop for UblkDev {
 struct UblkQueueState {
     cmd_inflight: u32,
     state: u32,
+    last_cqe_data: u64,
 }
 
 impl UblkQueueState {
@@ -526,8 +512,7 @@ impl UblkQueue<'_> {
             io_cmd_buf: io_cmd_buf as u64,
             dev,
             state: RefCell::new(UblkQueueState {
-                cmd_inflight: 0,
-                state: 0,
+                ..Default::default()
             }),
             q_ring: RefCell::new(ring),
             bufs,
@@ -774,6 +759,26 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
+    fn update_batch_state(&self, last: bool, cqe: &cqueue::Entry) {
+        let mut state = self.state.borrow_mut();
+        if last {
+            state.last_cqe_data = cqe.user_data();
+        }
+    }
+
+    /// Check if this io ctx is the last one in current batch
+    #[inline(always)]
+    pub fn is_last_io_ctx(&self, ictx: &UblkIOCtx) -> bool {
+        self.state.borrow().last_cqe_data == ictx.user_data()
+    }
+
+    /// Check if this cqe is the last one in current batch
+    #[inline(always)]
+    pub fn get_last_cqe_data(&self) -> u64 {
+        self.state.borrow().last_cqe_data
+    }
+
+    #[inline(always)]
     fn reap_one_event<F>(&self, ops: F, idx: i32, cnt: i32) -> usize
     where
         F: FnMut(&UblkQueue, u16, &UblkIOCtx),
@@ -789,18 +794,10 @@ impl UblkQueue<'_> {
             }
         };
 
-        let ctx = UblkIOCtx(
-            &cqe,
-            if idx == 0 {
-                UblkIOCtx::UBLK_IO_F_FIRST
-            } else {
-                0
-            } | if idx + 1 == cnt {
-                UblkIOCtx::UBLK_IO_F_LAST
-            } else {
-                0
-            },
-        );
+        let ctx = UblkIOCtx(&cqe);
+        if (self.flags & UBLK_DEV_F_PROVIDE_BATCH_LAST) != 0 {
+            self.update_batch_state(idx + 1 == cnt, &cqe);
+        }
         self.handle_cqe(ops, &ctx);
 
         1
@@ -990,19 +987,10 @@ impl UblkQueue<'_> {
                         }
                     };
 
-                    let e = UblkIOCtx(
-                        &cqe,
-                        if idx == 0 {
-                            UblkIOCtx::UBLK_IO_F_FIRST
-                        } else {
-                            0
-                        } | if idx + 1 == done {
-                            UblkIOCtx::UBLK_IO_F_LAST
-                        } else {
-                            0
-                        },
-                    );
-
+                    let e = UblkIOCtx(&cqe);
+                    if (self.flags & UBLK_DEV_F_PROVIDE_BATCH_LAST) != 0 {
+                        self.update_batch_state(idx + 1 == done, &cqe);
+                    }
                     let data = e.user_data();
                     let res = e.result();
                     let tag = UblkIOCtx::user_data_to_tag(data);
