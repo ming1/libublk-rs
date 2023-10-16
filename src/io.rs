@@ -1031,7 +1031,7 @@ impl UblkQueue<'_> {
                         exe.wake_with_uring_cqe(tag as u16, &cqe);
                     }
                 }
-                Ok(0)
+                Ok(done)
             }
         }
     }
@@ -1062,18 +1062,40 @@ impl UblkQueue<'_> {
     /// # Arguments:
     ///
     /// * `ops`: IO handling closure
+    /// * `bg_ops`: background IO handling closure, which is optional, and
+    ///     always called after one io_uring cqe batch is handled, and usually
+    ///     for handling target meta IO, such as extra io tasks(defined by
+    ///     `Ublkdev.tgt.extra_ios`) can be spawn for doing that. &UblkQueue
+    ///     and current batch size are passed to this background handler.
     ///
     /// Called in queue context. won't return unless error is observed.
     /// Wait and handle any incoming cqe until queue is down.
     ///
-    pub fn wait_and_handle_io_cmd<F>(&self, exe: &Executor, mut ops: F)
-    where
+    pub fn wait_and_handle_io_cmd<F>(
+        &self,
+        exe: &Executor,
+        mut ops: F,
+        bg_ops: Option<Box<dyn FnMut(i32)>>,
+    ) where
         F: FnMut(u16, &UblkIOCtx),
     {
-        loop {
-            match self.process_io_cmds(exe, &mut ops, 1) {
-                Err(_) => break,
-                _ => continue,
+        if let Some(mut bg) = bg_ops {
+            loop {
+                match self.process_io_cmds(exe, &mut ops, 1) {
+                    Err(_) => break,
+                    Ok(done) => {
+                        if done > 0 {
+                            bg(done);
+                        }
+                    }
+                }
+            }
+        } else {
+            loop {
+                match self.process_io_cmds(exe, &mut ops, 1) {
+                    Err(_) => break,
+                    Ok(_) => {}
+                }
             }
         }
     }

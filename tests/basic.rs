@@ -171,7 +171,8 @@ mod integration {
 
         //Device wide data shared among all queue context
         struct DevData {
-            spawned: i32,
+            spawned: u32,
+            nr_batch: u32,
         }
 
         let sess = libublk::UblkSessionBuilder::default()
@@ -189,7 +190,10 @@ mod integration {
         };
 
         // device data is shared among all queue contexts
-        let dev_data = Arc::new(Mutex::new(DevData { spawned: 0 }));
+        let dev_data = Arc::new(Mutex::new(DevData {
+            spawned: 0,
+            nr_batch: 0,
+        }));
         let saved_dev_data_addr = Arc::new(Mutex::new({
             std::ptr::addr_of!(*(dev_data.lock().unwrap())) as u64
         }));
@@ -206,6 +210,7 @@ mod integration {
             // @q_fn closure implements Clone() Trait, so the captured
             // @dev_data is cloned to @q_fn context.
             let _dev_data = Rc::new(dev_data);
+            let _dev_data_bg = _dev_data.clone();
 
             // make sure that all queues see same device data
             let _dev_addr = Rc::new(saved_dev_data_addr);
@@ -226,7 +231,12 @@ mod integration {
                     null_handle_io_cmd(&q, tag).await;
                 });
             };
-            q.wait_and_handle_io_cmd(&exe_rc, io_handler);
+
+            let bg_handler = move |_done: i32| {
+                let mut guard = _dev_data_bg.lock().unwrap();
+                (*guard).nr_batch += 1;
+            };
+            q.wait_and_handle_io_cmd(&exe_rc, io_handler, Some(Box::new(bg_handler)));
         };
 
         // kick off our targets
