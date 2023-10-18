@@ -1,9 +1,18 @@
 use clap::{Arg, ArgAction, Command};
 use libublk::dev_flags::*;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-use libublk::{ctrl::UblkCtrl, UblkIORes, UblkSession};
+use libublk::{ctrl::UblkCtrl, exe::Executor, UblkIORes, UblkSession};
+use std::rc::Rc;
 
-fn test_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u32) {
+#[inline]
+fn handle_io_cmd(q: &UblkQueue, tag: u16) {
+    let iod = q.get_iod(tag);
+    let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+
+    q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
+}
+
+fn test_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u32, aio: bool) {
     let _pid = unsafe { libc::fork() };
 
     if _pid == 0 {
@@ -24,25 +33,46 @@ fn test_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u32)
         let wh = {
             let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
             // queue level logic
-            let q_handler = move |qid: u16, _dev: &UblkDev| {
+            let q_sync_handler = move |qid: u16, _dev: &UblkDev| {
                 // logic for io handling
                 let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
-                    let iod = q.get_iod(tag);
-                    let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
-
-                    q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
+                    handle_io_cmd(q, tag);
                 };
 
                 UblkQueue::new(qid, _dev)
                     .unwrap()
                     .wait_and_handle_io(io_handler);
             };
+            let q_async_handler = move |qid: u16, dev: &UblkDev| {
+                let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
+                let exe_rc = Rc::new(Executor::new(dev.get_nr_ios()));
+                let q = q_rc.clone();
+                let exe = exe_rc.clone();
+
+                async fn null_handle_io_cmd(q: &UblkQueue<'_>, tag: u16) {
+                    handle_io_cmd(q, tag);
+                }
+
+                let io_handler = move |tag: u16, _io: &UblkIOCtx| {
+                    let q = q_rc.clone();
+
+                    exe.spawn(tag as u16, async move {
+                        null_handle_io_cmd(&q, tag).await;
+                    });
+                };
+                q.wait_and_handle_io_cmd(&exe_rc, io_handler, None);
+            };
 
             // Now start this ublk target
-            sess.run_target(&mut ctrl, &dev, q_handler, |dev_id| {
-                let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-                d_ctrl.dump();
-            })
+            sess.run_target(
+                &mut ctrl,
+                &dev,
+                if aio { q_sync_handler } else { q_async_handler },
+                |dev_id| {
+                    let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+                    d_ctrl.dump();
+                },
+            )
             .unwrap()
         };
         wh.join().unwrap();
@@ -102,6 +132,13 @@ fn main() {
                         .short('p')
                         .action(ArgAction::SetTrue)
                         .help("enable UBLK_F_UN_PRIVILEGED_DEV"),
+                )
+                .arg(
+                    Arg::new("async")
+                        .long("async")
+                        .short('a')
+                        .action(ArgAction::SetTrue)
+                        .help("use async/await to handle IO command"),
                 ),
         )
         .subcommand(
@@ -150,7 +187,12 @@ fn main() {
                 0
             };
 
-            test_add(id, nr_queues, depth, ctrl_flags, buf_size);
+            let aio = if add_matches.get_flag("async") {
+                true
+            } else {
+                false
+            };
+            test_add(id, nr_queues, depth, ctrl_flags, buf_size, aio);
         }
         Some(("del", add_matches)) => {
             let id = add_matches
