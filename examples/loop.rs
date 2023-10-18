@@ -176,8 +176,9 @@ fn test_add(
     backing_file: &String,
     ctrl_flags: u64,
     aio: bool,
+    fg: bool,
 ) {
-    let _pid = unsafe { libc::fork() };
+    let _pid = if !fg { unsafe { libc::fork() } } else { 0 };
 
     if _pid == 0 {
         __test_add(id, nr_queues, depth, buf_sz, backing_file, ctrl_flags, aio);
@@ -315,6 +316,12 @@ fn main() {
                         .short('a')
                         .action(ArgAction::SetTrue)
                         .help("use async/await to handle IO command"),
+                )
+                .arg(
+                    Arg::new("forground")
+                        .long("forground")
+                        .action(ArgAction::SetTrue)
+                        .help("run in forground mode"),
                 ),
         )
         .subcommand(
@@ -354,6 +361,11 @@ fn main() {
                 .unwrap_or(52288);
             let backing_file = add_matches.get_one::<String>("backing_file").unwrap();
 
+            let fg = if add_matches.get_flag("forground") {
+                true
+            } else {
+                false
+            };
             let ctrl_flags: u64 = if add_matches.get_flag("unprivileged") {
                 libublk::sys::UBLK_F_UNPRIVILEGED_DEV as u64
             } else {
@@ -372,6 +384,7 @@ fn main() {
                 backing_file,
                 ctrl_flags,
                 aio,
+                fg,
             );
         }
         Some(("del", add_matches)) => {

@@ -12,8 +12,16 @@ fn handle_io_cmd(q: &UblkQueue, tag: u16) {
     q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
 }
 
-fn test_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u32, aio: bool) {
-    let _pid = unsafe { libc::fork() };
+fn test_add(
+    id: i32,
+    nr_queues: u32,
+    depth: u32,
+    ctrl_flags: u64,
+    buf_size: u32,
+    aio: bool,
+    fg: bool,
+) {
+    let _pid = if !fg { unsafe { libc::fork() } } else { 0 };
     if _pid == 0 {
         __test_add(id, nr_queues, depth, ctrl_flags, buf_size, aio);
     }
@@ -142,6 +150,12 @@ fn main() {
                         .short('a')
                         .action(ArgAction::SetTrue)
                         .help("use async/await to handle IO command"),
+                )
+                .arg(
+                    Arg::new("forground")
+                        .long("forground")
+                        .action(ArgAction::SetTrue)
+                        .help("run in forground mode"),
                 ),
         )
         .subcommand(
@@ -195,7 +209,12 @@ fn main() {
             } else {
                 false
             };
-            test_add(id, nr_queues, depth, ctrl_flags, buf_size, aio);
+            let fg = if add_matches.get_flag("forground") {
+                true
+            } else {
+                false
+            };
+            test_add(id, nr_queues, depth, ctrl_flags, buf_size, aio, fg);
         }
         Some(("del", add_matches)) => {
             let id = add_matches
