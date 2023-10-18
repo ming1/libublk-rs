@@ -180,68 +180,78 @@ fn test_add(
     let _pid = unsafe { libc::fork() };
 
     if _pid == 0 {
-        // LooTgt has to live in the whole device lifetime
-        let lo = LoopTgt {
-            back_file: std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&backing_file)
-                .unwrap(),
-            direct_io: 1,
-            back_file_path: backing_file.clone(),
-        };
-        let wh = {
-            let sess = libublk::UblkSessionBuilder::default()
-                .name("example_loop")
-                .id(id)
-                .ctrl_flags(ctrl_flags)
-                .nr_queues(nr_queues)
-                .depth(depth)
-                .io_buf_bytes(buf_sz)
-                .dev_flags(UBLK_DEV_F_ADD_DEV)
-                .build()
-                .unwrap();
-
-            let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo);
-            let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-            let q_async_fn = move |qid: u16, dev: &UblkDev| {
-                let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
-                let exe_rc = Rc::new(Executor::new(dev.get_nr_ios()));
-                let q = q_rc.clone();
-                let exe = exe_rc.clone();
-
-                let lo_io_handler = move |tag: u16, _io: &UblkIOCtx| {
-                    let q = q_rc.clone();
-
-                    exe.spawn(tag as u16, async move {
-                        lo_handle_io_cmd_async(&q, tag).await;
-                    });
-                };
-                q.wait_and_handle_io_cmd(&exe_rc, lo_io_handler, None);
-            };
-
-            let q_sync_fn = move |qid: u16, _dev: &UblkDev| {
-                let lo_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
-                    lo_handle_io_cmd_sync(q, tag, io)
-                };
-                UblkQueue::new(qid, _dev)
-                    .unwrap()
-                    .wait_and_handle_io(lo_io_handler);
-            };
-
-            sess.run_target(
-                &mut ctrl,
-                &dev,
-                if aio { q_async_fn } else { q_sync_fn },
-                |dev_id| {
-                    let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-                    d_ctrl.dump();
-                },
-            )
-            .unwrap()
-        };
-        wh.join().unwrap();
+        __test_add(id, nr_queues, depth, buf_sz, backing_file, ctrl_flags, aio);
     }
+}
+fn __test_add(
+    id: i32,
+    nr_queues: u32,
+    depth: u32,
+    buf_sz: u32,
+    backing_file: &String,
+    ctrl_flags: u64,
+    aio: bool,
+) {
+    // LooTgt has to live in the whole device lifetime
+    let lo = LoopTgt {
+        back_file: std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&backing_file)
+            .unwrap(),
+        direct_io: 1,
+        back_file_path: backing_file.clone(),
+    };
+    let wh = {
+        let sess = libublk::UblkSessionBuilder::default()
+            .name("example_loop")
+            .id(id)
+            .ctrl_flags(ctrl_flags)
+            .nr_queues(nr_queues)
+            .depth(depth)
+            .io_buf_bytes(buf_sz)
+            .dev_flags(UBLK_DEV_F_ADD_DEV)
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo);
+        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let q_async_fn = move |qid: u16, dev: &UblkDev| {
+            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
+            let exe_rc = Rc::new(Executor::new(dev.get_nr_ios()));
+            let q = q_rc.clone();
+            let exe = exe_rc.clone();
+
+            let lo_io_handler = move |tag: u16, _io: &UblkIOCtx| {
+                let q = q_rc.clone();
+
+                exe.spawn(tag as u16, async move {
+                    lo_handle_io_cmd_async(&q, tag).await;
+                });
+            };
+            q.wait_and_handle_io_cmd(&exe_rc, lo_io_handler, None);
+        };
+
+        let q_sync_fn = move |qid: u16, _dev: &UblkDev| {
+            let lo_io_handler =
+                move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| lo_handle_io_cmd_sync(q, tag, io);
+            UblkQueue::new(qid, _dev)
+                .unwrap()
+                .wait_and_handle_io(lo_io_handler);
+        };
+
+        sess.run_target(
+            &mut ctrl,
+            &dev,
+            if aio { q_async_fn } else { q_sync_fn },
+            |dev_id| {
+                let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+                d_ctrl.dump();
+            },
+        )
+        .unwrap()
+    };
+    wh.join().unwrap();
 }
 
 fn main() {
